@@ -1,0 +1,13 @@
+--- a/app/main.py
++++ b/app/main.py
+@@ -8,7 +8,7 @@
+ @app.get("/")
+ async def root(request: Request):
+     # Simulate a SQL injection leak
+-    query = request.query_params.get("id", "1")
+-    if "OR '1'='1'" in query:
+-        return HTMLResponse(content="EXPLOIT_LEAK: admin_password=supersecret", status_code=200)
++    query = request.query_params.get("id", "1")
++    if "OR" in query or "'" in query:
++        return HTMLResponse(content="Invalid Input", status_code=400)
+     return HTMLResponse(content="Hello World")
