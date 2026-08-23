@@ -1,5 +1,5 @@
 [project]
-name = "patchproof"
+name = "patchproof-repro"
 version = "0.1.0"
 description = "Deterministic exploit repro + AI patch verification engine."
 readme = "README.md"

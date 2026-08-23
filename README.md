@@ -38,8 +38,13 @@ suite.
 
 ## Install
 
+> PyPI/npm name: **`patchproof-repro`** (the `patchproof` names were taken).
+> Import as `patchproof`, run as `patchproof`.
+
 ```bash
-git clone https://github.com/<you>/patchproof
+pip install patchproof-repro
+# or from source:
+git clone https://github.com/purvanshbhatt/patchproof
 cd patchproof
 uv pip install -e '.[all]'          # or: pip install -e '.[all]'
 ```
