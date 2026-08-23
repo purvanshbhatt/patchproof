@@ -19,6 +19,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+sign = ["cryptography>=42"]
+mcp = ["mcp>=1.0"]
 dev = [
   "pytest>=8",
   "pytest-asyncio>=0.23",
@@ -38,3 +40,27 @@ packages = ["src/patchproof"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "PIE", "PLC", "PLW", "S"]
+ignore = [
+  "B008",   # typer.Option()/typer.Argument() in defaults is the typer idiom
+  "BLE001", # best-effort cleanup paths intentionally catch broadly
+  "PLW1510",# subprocess.run default check=False is deliberate in sandbox code
+  "S110",   # try-except-pass in best-effort docker cleanup
+  "S112",   # try-except-continue in file scanning
+  "S603",   # subprocess with fixed argv, not user input
+  "S607",   # partial executable path (docker) resolved via PATH by design
+]
+
+[tool.ruff.lint.per-file-ignores]
+# pytest asserts, fixture 0.0.0.0 bind, lazy import of optional cryptography
+"tests/**" = ["S101", "S104", "PLC0415"]
+# lazy imports keep CLI startup fast and optional deps optional
+"src/patchproof/**" = ["PLC0415"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "integration: end-to-end tests that require Docker",
+]

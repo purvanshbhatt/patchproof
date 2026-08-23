@@ -1,5 +1,4 @@
 from pathlib import Path
-from typing import Optional
 
 import typer
 from rich.console import Console
@@ -23,7 +22,7 @@ def _version_callback(value: bool) -> None:
 
 @app.callback()
 def main(
-    version: Optional[bool] = typer.Option(
+    version: bool | None = typer.Option(
         None,
         "--version",
         callback=_version_callback,
@@ -41,7 +40,7 @@ def run(
     max_attempts: int = typer.Option(5, "--max-attempts", help="Max AI patch iterations."),
     model: str = typer.Option("gpt-4o-mini", "--model", help="LiteLLM model id."),
     out: Path = typer.Option(Path("patchproof-out"), "--out", help="Output directory."),
-    hardcoded_patch: Optional[Path] = typer.Option(
+    hardcoded_patch: Path | None = typer.Option(
         None,
         "--hardcoded-patch",
         help="Skip LLM; apply this diff file and verify (skeleton mode).",

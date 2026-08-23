@@ -4,9 +4,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
 
 import httpx
 
@@ -22,7 +22,7 @@ class PoC:
             json.dumps(self.payload, sort_keys=True).encode()
         ).hexdigest()
 
-    def run(self, base_url: str, timeout: float = 5.0) -> "PoCResult":
+    def run(self, base_url: str, timeout: float = 5.0) -> PoCResult:
         url = self.payload.get("url", "")
         if not url.startswith("http"):
             url = base_url.rstrip("/") + url
@@ -91,7 +91,7 @@ def _parse_curl(text: str) -> dict:
     method = "GET"
     url = ""
     headers: dict[str, str] = {}
-    body: Optional[str] = None
+    body: str | None = None
     i = 0
     while i < len(args):
         a = args[i].strip("'\"")
@@ -122,7 +122,7 @@ def _detect(text: str) -> tuple[str, dict, Callable]:
     if s.startswith("curl "):
         parsed = _parse_curl(s)
         return "curl", parsed, _default_predicate("error")
-    if s.startswith("GET ") or s.startswith("POST ") or s.startswith("PUT ") or s.startswith("DELETE "):
+    if s.startswith(("GET ", "POST ", "PUT ", "DELETE ", "PATCH ", "HEAD ", "OPTIONS ")):
         # raw HTTP request line
         lines = s.splitlines()
         parts = lines[0].split(" ")
@@ -138,7 +138,9 @@ def _detect(text: str) -> tuple[str, dict, Callable]:
                 headers[k.strip()] = v.strip()
         body = "\n".join(lines[body_start:]) if body_start < len(lines) else None
         return "http", {"method": method, "url": path, "headers": headers, "body": body}, _default_predicate("error")
-    if s.startswith("{") and '"nuclei"' in s.lower():
+    if s.startswith("{") and any(
+        k in s.lower() for k in ('"nuclei"', '"matchers"', '"template', '"extractor')
+    ):
         # nuclei template — coarse parse
         try:
             data = json.loads(s)
@@ -146,7 +148,11 @@ def _detect(text: str) -> tuple[str, dict, Callable]:
             if reqs:
                 r0 = reqs[0]
                 method = (r0.get("method") or "GET").upper()
-                path = r0.get("path") or ["/"][0]
+                raw_path = r0.get("path")
+                if isinstance(raw_path, (list, tuple)):
+                    path = raw_path[0] if raw_path else "/"
+                else:
+                    path = raw_path or "/"
                 matchers = r0.get("matchers", [])
                 needle = ""
                 for m in matchers:
@@ -156,8 +162,17 @@ def _detect(text: str) -> tuple[str, dict, Callable]:
                             needle = words[0]
                             break
                     if m.get("type") == "status":
-                        return "nuclei", {"method": method, "url": path, "headers": {}, "body": None}, \
-                            (lambda code=int(m.get("status", [200])[0]): (lambda r: r.status_code == code))()
+                        codes = m.get("status", [200])
+                        code = int(codes[0]) if isinstance(codes, (list, tuple)) else int(codes)
+
+                        def _status_pred(r: httpx.Response, _code: int = code) -> bool:
+                            return r.status_code == _code
+
+                        return (
+                            "nuclei",
+                            {"method": method, "url": path, "headers": {}, "body": None},
+                            _status_pred,
+                        )
                 return "nuclei", {"method": method, "url": path, "headers": {}, "body": None}, _default_predicate(needle or "error")
         except Exception:
             pass

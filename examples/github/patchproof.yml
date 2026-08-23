@@ -1,0 +1,54 @@
+name: patchproof
+
+on:
+  pull_request:
+    paths:
+      - "**/*.py"
+      - "**/*.js"
+      - "**/*.ts"
+      - ".patchproof/**"
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      docker:
+        image: docker:dind
+        options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PatchProof
+        run: pip install -e .
+
+      - name: Run PatchProof on staged reports
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          reports=(.patchproof/*.json)
+          if [ ${#reports[@]} -eq 0 ]; then
+            echo "no .patchproof/*.json reports; nothing to do"
+            exit 0
+          fi
+          for r in "${reports[@]}"; do
+            echo "::group::Verifying ${r}"
+            patchproof verify \
+              --app "$(jq -r .app_path "${r}")" \
+              --poc "$(jq -r .poc_path "${r}")" \
+              --patch "$(jq -r .patch_path "${r}")"
+            echo "::endgroup::"
+          done
+
+      - name: Upload attestations
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: patchproof-attestations
+          path: patchproof-out/**/attestation.json

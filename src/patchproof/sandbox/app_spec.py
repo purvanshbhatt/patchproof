@@ -24,7 +24,6 @@ def detect_app_spec(app_path: Path) -> AppSpec:
 
 
 def _python_spec(app_path: Path) -> AppSpec:
-    files = {p.name for p in app_path.rglob("*.py")}
     reqs = (app_path / "requirements.txt").read_text().lower() if (app_path / "requirements.txt").exists() else ""
     framework = "unknown"
     if "fastapi" in reqs:
