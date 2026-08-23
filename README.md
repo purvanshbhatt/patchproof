@@ -1,7 +1,26 @@
 # PatchProof
 
+[![PyPI](https://img.shields.io/pypi/v/patchproof-repro)](https://pypi.org/project/patchproof-repro/)
+[![npm](https://img.shields.io/npm/v/patchproof-repro)](https://www.npmjs.com/package/patchproof-repro)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+![Python](https://img.shields.io/badge/python-3.11%2B-blue)
+[![GitHub stars](https://img.shields.io/github/stars/purvanshbhatt/patchproof?style=social)](https://github.com/purvanshbhatt/patchproof/stargazers)
+
 > **Deterministic exploit repro + AI patch verification engine.**
 > Bridging the gap between "we found a bug" and "we proved the fix works."
+
+<!-- Demo GIF: record with `vhs demo/demo.tape`, then uncomment:
+<p align="center">
+  <img src="demo/demo.gif" alt="PatchProof turning a red exploit into a green verified fix" width="100%">
+</p>
+-->
+
+| | |
+|---|---|
+| 🔴 **Red** | PoC exploit succeeds against your app in an ephemeral Docker sandbox |
+| 🤖 **Patch** | LLM drafts a minimal unified diff; hot-reload inside the container |
+| 🟢 **Green** | Exact same PoC now fails; native test suite passes |
+| 📦 **Artifacts** | Merge-ready `.patch` + regression test + signed attestation |
 
 PatchProof takes a target source tree and a Proof-of-Concept exploit (curl,
 raw HTTP, Nuclei template, Python script), spins up an **ephemeral Docker
@@ -107,8 +126,28 @@ Tools exposed:
 
 ## CI / pre-commit
 
-- **GitHub Actions**: see `examples/github/patchproof.yml`.
-- **pre-commit hook**: see `examples/hooks/pre-commit` (symlink into `.git/hooks/`).
+### GitHub Action (on every PR)
+
+```yaml
+- uses: purvanshbhatt/patchproof@v0.1.0
+  with:
+    app-path: ./my-app
+    poc-path: .patchproof/poc.txt
+    patch-file: .patchproof/fix.patch
+```
+
+### pre-commit framework
+
+```yaml
+# .pre-commit-config.yaml
+repos:
+  - repo: https://github.com/purvanshbhatt/patchproof
+    rev: v0.1.0
+    hooks:
+      - id: patchproof-verify   # expects .patchproof/{poc.txt,fix.patch}
+```
+
+Or the plain shell hook: [`examples/hooks/pre-commit`](examples/hooks/pre-commit).
 
 ## Architecture
 
@@ -132,6 +171,11 @@ pytest -m 'not integration'          # unit tests (no Docker)
 pytest                                # all tests (needs Docker)
 ruff check src tests
 ```
+
+## Roadmap & launch
+
+- [ROADMAP.md](ROADMAP.md) — community tier backlog + enterprise SaaS phases.
+- Launch post drafts for Show HN, Reddit, and awesome-lists: [`docs/launch/`](docs/launch/).
 
 ## License
 

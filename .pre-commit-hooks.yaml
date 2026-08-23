@@ -1,0 +1,24 @@
+# Distributable pre-commit hooks.
+#
+# Usage in your project's .pre-commit-config.yaml:
+#
+#   repos:
+#     - repo: https://github.com/purvanshbhatt/patchproof
+#       rev: v0.1.0
+#       hooks:
+#         - id: patchproof-verify
+#
+# The hook expects the conventional layout:
+#   .patchproof/poc.txt    PoC exploit (curl / raw HTTP / Nuclei / Python)
+#   .patchproof/fix.patch  unified diff to verify
+# It fails the commit when the patch does not block the PoC or breaks tests.
+
+- id: patchproof-verify
+  name: PatchProof — verify patch blocks PoC
+  description: Re-executes the PoC against a Docker sandbox to confirm the fix works.
+  entry: patchproof verify --app . --poc .patchproof/poc.txt --patch .patchproof/fix.patch
+  language: python
+  additional_dependencies: ["patchproof-repro==0.1.0"]
+  pass_filenames: false
+  always_run: false
+  files: ^\.patchproof/

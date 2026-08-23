@@ -1,0 +1,63 @@
+name: "PatchProof Verify"
+description: >
+  Verify a security patch by spinning up the app in Docker, re-executing the
+  PoC exploit, and running regression tests. Fails the job if the patch does
+  not block the exploit or breaks tests.
+
+branding:
+  icon: "shield"
+  color: "green"
+
+inputs:
+  app-path:
+    description: "Path to the target application source."
+    required: true
+  poc-path:
+    description: "Path to the PoC exploit file (curl / raw HTTP / Nuclei JSON / Python)."
+    required: true
+  patch-file:
+    description: "Unified diff to verify."
+    required: true
+  python-version:
+    description: "Python version used to install patchproof-repro."
+    required: false
+    default: "3.12"
+
+runs:
+  using: "composite"
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install PatchProof
+      shell: bash
+      run: pip install patchproof-repro
+
+    - name: Red baseline (PoC must reproduce)
+      shell: bash
+      run: |
+        echo "::group::Red baseline"
+        docker version
+        echo "::endgroup::"
+
+    - name: PatchProof verify
+      shell: bash
+      env:
+        PATCHPROOF_APP: ${{ inputs.app-path }}
+        PATCHPROOF_POC: ${{ inputs.poc-path }}
+        PATCHPROOF_PATCH: ${{ inputs.patch-file }}
+      run: |
+        set -euo pipefail
+        patchproof verify \
+          --app "$PATCHPROOF_APP" \
+          --poc "$PATCHPROOF_POC" \
+          --patch "$PATCHPROOF_PATCH"
+
+    - name: Upload attestations
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: patchproof-attestations
+        path: patchproof-out/
+        if-no-files-found: ignore
