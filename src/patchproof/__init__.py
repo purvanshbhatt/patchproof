@@ -1,3 +1,3 @@
-"""PatchProof — deterministic exploit repro + AI patch verification."""
+"""PatchProof - exploit-verified patch engine for web apps."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

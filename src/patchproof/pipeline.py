@@ -1,33 +1,40 @@
-"""Top-level orchestration: ingest → sandbox → red → patch → green → attest."""
+"""Top-level orchestration: ingest -> sandbox -> red -> patch -> green -> attest.
+
+Exit codes (also the return value of run()/verify_only()):
+  0  green (exploit-verified patch) OR not exploitable
+  2  still red (exploit survives every attempt)
+  3  patch broke regression tests
+  4  patch did not apply
+  5  weak patch (base blocked but a variant still succeeds)
+"""
 from __future__ import annotations
 
-import shutil
-import subprocess
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 from rich.console import Console
 
-from .ingest.normalize import load_poc, PoC
-from .report.attestation import Attestation, write_attestation
+from . import __version__
+from .ingest.normalize import PoC, load_poc
+from .patch.apply import WorkCopy, apply_diff, diff_against_baseline, rollback
+from .report.attestation import (
+    Attestation,
+    ExploitVerifiedPredicate,
+    VariantOutcome,
+    now_iso,
+    tree_sha256,
+    write_attestation,
+    write_openvex,
+)
 from .report.tui import LiveDisplay, Verdict
-from .sandbox.docker import Sandbox
-from .sandbox.app_spec import detect_app_spec, AppSpec
+from .sandbox.app_spec import detect_app_spec
+from .sandbox.runner import make_runner
 
 console = Console()
 
-
-@dataclass
-class PipelineResult:
-    red: bool = False
-    green: bool = False
-    attempts: int = 0
-    patch_path: Optional[Path] = None
-    attestation_path: Optional[Path] = None
-    artifacts: list[Path] = field(default_factory=list)
+OK, STILL_RED, REGRESSION, NO_APPLY, WEAK = 0, 2, 3, 4, 5
 
 
 @dataclass
@@ -35,159 +42,232 @@ class Pipeline:
     app_path: Path
     poc: Path
     max_attempts: int = 5
-    model: str = "gpt-4o-mini"
+    model: str = "anthropic/claude-sonnet-4-5"
     out_dir: Path = Path("patchproof-out")
-    hardcoded_patch: Optional[Path] = None
+    hardcoded_patch: Path | None = None
+    runner_backend: str = "auto"
+    check_variants: bool = True
+    vuln_id: str = "PATCHPROOF-UNSPECIFIED"
+    emit_vex: bool = False
 
-    def run(self) -> PipelineResult:
+    def run(self) -> int:
         run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
-        out_dir = self.out_dir / run_id
-        out_dir.mkdir(parents=True, exist_ok=True)
-        (out_dir / "evidence").mkdir(exist_ok=True)
+        out_dir = Path(self.out_dir) / run_id
+        (out_dir / "evidence").mkdir(parents=True, exist_ok=True)
+        (out_dir / "artifacts").mkdir(parents=True, exist_ok=True)
 
-        result = PipelineResult()
+        d = LiveDisplay(console)
+        d.banner(run_id, str(self.app_path), str(self.poc), self.runner_backend)
 
-        display = LiveDisplay(console=console)
-        display.banner(run_id, str(self.app_path), str(self.poc))
+        d.stage("ingest")
+        poc = load_poc(Path(self.poc))
+        from rich.markup import escape
+        d.info(escape(f"poc kind: {poc.kind}  oracle markers: {list(poc.oracle.markers)[:3]}"))
 
-        # --- Ingest ---
-        display.stage("ingest")
-        poc_obj = load_poc(self.poc)
-        display.info(f"PoC kind: {poc_obj.kind}")
+        d.stage("workcopy")
+        workdir = WorkCopy(src=Path(self.app_path), dest=out_dir / "workcopy").setup()
+        spec = detect_app_spec(workdir)
+        d.info(f"detected {spec.runtime}/{spec.framework} entry={spec.entry_file} app={spec.app_var}")
 
-        # --- Sandbox ---
-        display.stage("sandbox")
-        spec = detect_app_spec(self.app_path)
-        sandbox = Sandbox(app_path=self.app_path, spec=spec, out_dir=out_dir)
-        sandbox.up()
-        display.info(f"Container up: {sandbox.url}")
+        d.stage("sandbox")
+        runner = make_runner(self.runner_backend, workdir, spec)
+        runner.up()
+        d.info(f"serving at {runner.base_url}")
 
-        # --- Red baseline ---
-        display.stage("red")
-        red = sandbox.run_poc(poc_obj)
-        (out_dir / "evidence" / "red.json").write_text(red.as_json())
-        if not red.exploit_succeeded:
-            display.verdict(Verdict.NOT_EXPLOITABLE)
-            sandbox.down()
-            raise SystemExit(0)
-        result.red = True
-        display.verdict(Verdict.RED)
+        try:
+            # --- RED baseline ---
+            d.stage("red")
+            red = runner.run_poc(poc)
+            (out_dir / "evidence" / "red.json").write_text(red.as_json())
+            if not red.succeeded:
+                d.info(f"status={red.status} {red.note}")
+                d.verdict(Verdict.NOT_EXPLOITABLE)
+                return OK
+            d.verdict(Verdict.RED)
 
-        # --- Patch loop ---
-        display.stage("patch-loop")
+            # --- Patch loop ---
+            d.stage("patch")
+            attempts, applied = self._obtain_patch(d, runner, poc, red, workdir, out_dir)
+            if not applied:
+                d.verdict(Verdict.STILL_RED)
+                return STILL_RED
+
+            # --- GREEN: base exploit must be blocked ---
+            green = runner.run_poc(poc)
+            (out_dir / "evidence" / "green.json").write_text(green.as_json())
+            if green.succeeded:
+                rollback(workdir)
+                d.verdict(Verdict.STILL_RED)
+                return STILL_RED
+
+            # --- Variant replay (over-fitting / WAF-string guard) ---
+            variant_results: list[VariantOutcome] = []
+            if self.check_variants:
+                d.stage("variants")
+                for v in poc.variants():
+                    res = runner.run_poc(v)
+                    variant_results.append(VariantOutcome(v.label, blocked=not res.succeeded))
+                if variant_results:
+                    d.variant_table([(v.label, v.blocked) for v in variant_results])
+                if any(not v.blocked for v in variant_results):
+                    d.verdict(Verdict.VARIANTS_FAILED)
+                    self._attest(out_dir, workdir, poc, red, attempts, variant_results,
+                                 reg_ok=False, reg_note="not run (weak patch)", runner_name=type(runner).__name__)
+                    return WEAK
+
+            # --- Regression ---
+            d.stage("regression")
+            reg_ok, reg_note = runner.run_tests()
+            d.info(reg_note.splitlines()[-1] if reg_note else "")
+            if not reg_ok:
+                rollback(workdir)
+                d.verdict(Verdict.REGRESSION)
+                self._attest(out_dir, workdir, poc, red, attempts, variant_results,
+                             reg_ok=False, reg_note=reg_note, runner_name=type(runner).__name__)
+                return REGRESSION
+
+            # --- Artifacts + attestation ---
+            d.stage("attest")
+            self._write_fix(out_dir, workdir)
+            self._emit_regression_artifacts(out_dir, poc)
+            self._attest(out_dir, workdir, poc, red, attempts, variant_results,
+                         reg_ok=True, reg_note=reg_note, runner_name=type(runner).__name__)
+            d.verdict(Verdict.GREEN)
+            console.print(f"[bold green]Done.[/bold green] artifacts in [cyan]{out_dir}[/cyan]")
+            return OK
+        finally:
+            runner.down()
+
+    # ------------------------------------------------------------------ #
+    def _obtain_patch(self, d, runner, poc, red, workdir, out_dir) -> tuple[int, bool]:
         if self.hardcoded_patch is not None:
-            patch_text = self.hardcoded_patch.read_text()
-            display.info("Using hardcoded patch (skeleton mode, LLM skipped)")
-            attempts = 1
-        else:
-            from .patch.llm import generate_patch
-            from .patch.locator import locate
-            from .patch.apply import apply_diff, rollback
+            text = Path(self.hardcoded_patch).read_text()
+            d.info("applying supplied patch (no LLM)")
+            if not apply_diff(workdir, text):
+                d.warn("patch did not apply")
+                return 1, False
+            runner.reload()
+            return 1, True
 
-            attempts = 0
-            patch_text = ""
-            green = False
-            last_response = red.raw_response
-            for i in range(1, self.max_attempts + 1):
-                attempts = i
-                display.attempt(i, self.max_attempts)
-                target = locate(red, self.app_path)
-                patch_text = generate_patch(
-                    target=target,
-                    poc=poc_obj,
-                    red_response=red.raw_response,
-                    model=self.model,
-                )
-                ok = apply_diff(self.app_path, patch_text)
-                if not ok:
-                    display.warn("diff did not apply; retrying")
-                    continue
-                sandbox.reload()
-                time.sleep(0.5)
-                rep = sandbox.run_poc(poc_obj)
-                (out_dir / "evidence" / f"attempt_{i}.json").write_text(rep.as_json())
-                if not rep.exploit_succeeded:
-                    green = True
-                    break
-                rollback(self.app_path)
-                last_response = rep.raw_response
-            result.attempts = attempts
-            if not green:
-                display.verdict(Verdict.STILL_RED)
-                sandbox.down()
-                raise SystemExit(2)
+        from .patch.llm import generate_patch
+        from .patch.locator import locate
 
-        # Apply the final patch to disk for artifact emission.
-        if self.hardcoded_patch is None:
-            from .patch.apply import apply_diff as _apply
-            _apply(self.app_path, patch_text)
+        for i in range(1, self.max_attempts + 1):
+            d.attempt(i, self.max_attempts)
+            targets = locate(red, workdir)
+            diff = generate_patch(targets=targets, poc=poc, red=red, model=self.model)
+            (out_dir / "evidence" / f"attempt_{i}.diff").write_text(diff or "")
+            if not diff.strip():
+                d.warn("model returned no diff")
+                continue
+            if not apply_diff(workdir, diff):
+                d.warn("diff did not apply; retrying")
+                continue
+            runner.reload()
+            rep = runner.run_poc(poc)
+            if not rep.succeeded:
+                return i, True
+            d.warn("exploit still succeeds; rolling back")
+            rollback(workdir)
+            runner.reload()
+        return self.max_attempts, False
 
-        # --- Regression ---
-        display.stage("regression")
-        if not sandbox.run_tests():
-            display.verdict(Verdict.REGRESSION)
-            sandbox.down()
-            raise SystemExit(3)
+    def _write_fix(self, out_dir, workdir) -> None:
+        (out_dir / "fix.patch").write_text(diff_against_baseline(workdir))
 
-        # --- Artifacts ---
-        display.stage("attest")
-        fix_path = out_dir / "fix.patch"
-        fix_path.write_text(patch_text)
-        result.patch_path = fix_path
-
-        regression_test = sandbox.write_regression_test(poc_obj)
-        if regression_test is not None:
-            result.artifacts.append(regression_test)
-
-        attest = Attestation(
-            target_sha=sandbox.target_sha(),
-            poc_sha=poc_obj.sha256(),
-            attempts=attempts if self.hardcoded_patch is None else 1,
-            model=self.model if self.hardcoded_patch is None else "hardcoded",
-            verdict="green",
+    def _emit_regression_artifacts(self, out_dir, poc: PoC) -> None:
+        req = poc.payload
+        art = out_dir / "artifacts"
+        # pytest replay (dev team re-runs it)
+        markers = list(poc.oracle.markers)[:3]
+        (art / "test_patchproof_regression.py").write_text(
+            "import os, httpx\n"
+            "BASE = os.environ['PATCHPROOF_BASE_URL']\n"
+            f"PATH = {req.get('url', '/')!r}\n"
+            f"METHOD = {req.get('method', 'GET')!r}\n"
+            f"MARKERS = {markers!r}\n"
+            "def test_exploit_blocked():\n"
+            "    r = httpx.request(METHOD, BASE.rstrip('/') + '/' + PATH.lstrip('/'), timeout=10)\n"
+            "    assert r.status_code < 500, 'app crashed'\n"
+            "    low = r.text.lower()\n"
+            "    for m in MARKERS:\n"
+            "        assert m.lower() not in low, f'leak marker still present: {m}'\n"
         )
-        result.attestation_path = out_dir / "attestation.json"
-        write_attestation(attest, result.attestation_path)
-        result.artifacts.append(result.attestation_path)
+        # Nuclei template (security team re-runs it in CI)
+        (art / "patchproof-regression.yaml").write_text(
+            "id: patchproof-regression\n"
+            "info:\n  name: PatchProof regression\n  severity: info\n"
+            "http:\n"
+            f"  - method: {req.get('method', 'GET')}\n"
+            "    path:\n"
+            f"      - \"{{{{BaseURL}}}}{req.get('url', '/')}\"\n"
+            "    matchers-condition: or\n"
+            "    matchers:\n"
+            "      - type: status\n        status:\n          - 500\n"
+            + ("      - type: word\n        words:\n"
+               + "".join(f"          - \"{m}\"\n" for m in markers) if markers else "")
+        )
 
-        display.verdict(Verdict.GREEN)
-        sandbox.down()
-        console.print(f"[bold green]Done.[/bold green] Artifacts in [cyan]{out_dir}[/cyan]")
-        return result
+    def _attest(self, out_dir, workdir, poc, red, attempts, variant_results, *,
+                reg_ok, reg_note, runner_name) -> None:
+        pred = ExploitVerifiedPredicate(
+            tool="patchproof", tool_version=__version__, timestamp=now_iso(),
+            poc_sha256=poc.sha256(), poc_kind=poc.kind,
+            pre_patch_exploit_succeeded=True,
+            post_patch_exploit_blocked=True,
+            variants_total=len(variant_results),
+            variants_blocked=sum(1 for v in variant_results if v.blocked),
+            variant_results=variant_results,
+            regression_passed=reg_ok,
+            regression_note=(reg_note or "")[:500],
+            runner=runner_name,
+            model=self.model if self.hardcoded_patch is None else "supplied-patch",
+            attempts=attempts,
+        )
+        att = Attestation(
+            subject_name=str(self.app_path),
+            subject_sha256=tree_sha256(workdir),
+            predicate=pred,
+        )
+        write_attestation(att, out_dir / "attestation.json")
+        if self.emit_vex and reg_ok:
+            write_openvex(path=out_dir / "openvex.json", vuln_id=self.vuln_id,
+                          product=str(self.app_path))
 
 
-def verify_only(*, app_path: Path, poc: Path, patch_file: Path) -> int:
-    """CI mode. Returns 0 on green, non-zero on red or regression."""
-    from .patch.apply import apply_diff, rollback
-
-    spec = detect_app_spec(app_path)
-    out_dir = Path("patchproof-out") / "verify"
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    sandbox = Sandbox(app_path=app_path, spec=spec, out_dir=out_dir)
-    sandbox.up()
+def verify_only(*, app_path: Path, poc: Path, patch_file: Path,
+                runner_backend: str = "auto", check_variants: bool = True) -> int:
+    """CI mode: reproduce exploit, apply supplied patch, require exploit (and
+    variants) blocked and tests still passing. No LLM."""
+    out = Path("patchproof-out") / "verify"
+    (out).mkdir(parents=True, exist_ok=True)
+    poc_obj = load_poc(Path(poc))
+    workdir = WorkCopy(src=Path(app_path), dest=out / "workcopy").setup()
+    spec = detect_app_spec(workdir)
+    runner = make_runner(runner_backend, workdir, spec)
+    runner.up()
     try:
-        poc_obj = load_poc(poc)
-        red = sandbox.run_poc(poc_obj)
-        if not red.exploit_succeeded:
+        red = runner.run_poc(poc_obj)
+        if not red.succeeded:
             console.print("[yellow]PoC did not reproduce; nothing to verify.[/yellow]")
-            return 0
-        if not apply_diff(app_path, patch_file.read_text()):
+            return OK
+        if not apply_diff(workdir, Path(patch_file).read_text()):
             console.print("[red]Patch did not apply.[/red]")
-            return 4
-        sandbox.reload()
-        import time as _t
-        _t.sleep(0.5)
-        rep = sandbox.run_poc(poc_obj)
-        if rep.exploit_succeeded:
-            rollback(app_path)
-            console.print("[red]Patch failed to block exploit.[/red]")
-            return 5
-        if not sandbox.run_tests():
-            rollback(app_path)
-            console.print("[red]Patch broke regression tests.[/red]")
-            return 6
-        console.print("[bold green]Verified.[/bold green]")
-        return 0
+            return NO_APPLY
+        runner.reload()
+        if runner.run_poc(poc_obj).succeeded:
+            console.print("[red]Patch failed to block the exploit.[/red]")
+            return STILL_RED
+        if check_variants:
+            for v in poc_obj.variants():
+                if runner.run_poc(v).succeeded:
+                    console.print(f"[red]Variant '{v.label}' still succeeds.[/red]")
+                    return WEAK
+        ok, note = runner.run_tests()
+        if not ok:
+            console.print(f"[red]Patch broke tests:[/red]\n{note}")
+            return REGRESSION
+        console.print("[bold green]Verified: exploit blocked, variants blocked, tests pass.[/bold green]")
+        return OK
     finally:
-        sandbox.down()
+        runner.down()

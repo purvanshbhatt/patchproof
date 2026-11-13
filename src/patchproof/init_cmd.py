@@ -5,23 +5,22 @@ import typer
 
 TEMPLATE = """# patchproof configuration
 [app]
-# path = "./"
+# path = "./app"
 
 [poc]
-# path = "./poc.py"
+# path = "./poc.txt"
 
 [patch]
 max_attempts = 5
-model = "gpt-4o-mini"
+model = "anthropic/claude-sonnet-4-5"
 
-[regression]
-# command = "pytest -q"
-# command = "npm test --silent"
+[sandbox]
+# runner = "auto"   # auto | local | docker
 """
 
 
 def scaffold(directory: Path) -> None:
-    target = directory / "patchproof.toml"
+    target = Path(directory) / "patchproof.toml"
     if target.exists():
         typer.echo(f"already exists: {target}")
         raise typer.Exit(code=1)

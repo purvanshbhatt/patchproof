@@ -1,0 +1,13 @@
+diff --git a/main.py b/main.py
+index 68f3c4f..4e0f663 100644
+--- a/main.py
++++ b/main.py
+@@ -10,6 +10,8 @@ BASE = os.path.dirname(os.path.abspath(__file__))
+ def read():
+     # VULNERABLE: user-controlled filename joined without sanitization.
+     name = request.args.get("file", "readme.txt")
++    if "/" in name or "\\" in name or ".." in name:
++        return Response("invalid filename", status=400)
+     path = os.path.join(BASE, name)
+     try:
+         with open(path) as f:
