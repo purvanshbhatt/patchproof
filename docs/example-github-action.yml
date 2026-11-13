@@ -1,0 +1,37 @@
+# Example: gate pull requests on an exploit-verified fix.
+# Copy into .github/workflows/ in the app you are protecting.
+#
+# Convention: keep the exploit and its fix in the repo, e.g.
+#   security/poc.txt     - the reproduction (curl / raw HTTP / nuclei / python)
+#   security/fix.patch    - the patch under review (often the PR's own diff)
+name: patchproof-gate
+
+on:
+  pull_request:
+    paths:
+      - "app/**"
+      - "security/**"
+
+jobs:
+  exploit-verified:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install patchproof
+      - name: Exploit must be blocked, variants blocked, tests still pass
+        run: |
+          patchproof verify \
+            --app ./app \
+            --poc ./security/poc.txt \
+            --patch ./security/fix.patch \
+            --runner local
+      # Upload the attestation produced by `run` (optional):
+      # - run: patchproof run --app ./app --poc ./security/poc.txt \
+      #     --hardcoded-patch ./security/fix.patch --runner local
+      # - uses: actions/upload-artifact@v4
+      #   with:
+      #     name: patchproof-attestation
+      #     path: patchproof-out/**/attestation.json

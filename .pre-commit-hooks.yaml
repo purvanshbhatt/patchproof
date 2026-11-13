@@ -18,7 +18,7 @@
   description: Re-executes the PoC against a Docker sandbox to confirm the fix works.
   entry: patchproof verify --app . --poc .patchproof/poc.txt --patch .patchproof/fix.patch
   language: python
-  additional_dependencies: ["patchproof-repro==0.1.0"]
+  additional_dependencies: ["patchproof==0.1.0"]
   pass_filenames: false
   always_run: false
   files: ^\.patchproof/

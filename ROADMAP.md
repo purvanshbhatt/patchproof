@@ -2,8 +2,8 @@
 
 Status: v0.1.0 — single-container local execution, live on
 [GitHub](https://github.com/purvanshbhatt/patchproof) /
-[PyPI](https://pypi.org/project/patchproof-repro/) /
-[npm](https://www.npmjs.com/package/patchproof-repro).
+[PyPI](https://pypi.org/project/patchproof/) /
+[npm](https://www.npmjs.com/package/patchproof).
 
 ## Community tier (open source, Apache-2.0) — free forever
 

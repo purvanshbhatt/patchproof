@@ -2,7 +2,7 @@
 /**
  * PatchProof npm launcher.
  *
- * Ensures Python + the `patchproof-repro` PyPI package are available, then
+ * Ensures Python + the `patchproof` PyPI package are available, then
  * forwards all arguments to the `patchproof` CLI.
  *
  * Env overrides:
@@ -15,7 +15,7 @@ const { spawnSync } = require("child_process");
 const os = require("os");
 const path = require("path");
 
-const PYPI_PACKAGE = "patchproof-repro";
+const PYPI_PACKAGE = "patchproof";
 const MIN_PY = [3, 11];
 
 function candidates() {

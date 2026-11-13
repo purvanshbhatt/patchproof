@@ -27,7 +27,7 @@ fully offline and still produces attestations — useful as a CI gate for
 human-written fixes.
 
 Repo: https://github.com/purvanshbhatt/patchproof
-PyPI: https://pypi.org/project/patchproof-repro/
+PyPI: https://pypi.org/project/patchproof/
 
 Feedback wanted on: sandbox hardening (currently one container, no network
 isolation yet), Nuclei matcher coverage, and what evidence format your
@@ -41,7 +41,7 @@ I built a tool that takes a PoC exploit, patches your FastAPI/Flask/Express app 
 
 ## r/Python — body
 
-TL;DR: `pip install patchproof-repro`, point it at a vulnerable app + a curl
+TL;DR: `pip install patchproof`, point it at a vulnerable app + a curl
 command, and watch red turn green:
 
 ```bash

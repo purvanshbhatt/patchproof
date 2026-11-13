@@ -20,7 +20,7 @@ blocked (GREEN) — then runs the project's test suite and emits a merge-ready
 Action, pre-commit hook, and MCP server.
 
 - Repo: https://github.com/purvanshbhatt/patchproof
-- PyPI: https://pypi.org/project/patchproof-repro/
+- PyPI: https://pypi.org/project/patchproof/
 - License: Apache-2.0
 
 Suggested entry (matches list style):

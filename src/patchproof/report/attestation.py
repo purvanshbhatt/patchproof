@@ -1,83 +1,99 @@
-"""Attestation writer.
+"""Exploit-verified attestation.
 
-Schema (JSON):
-    {
-      "target_sha": "<sha256 of source tree>",
-      "poc_sha":    "<sha256 of normalized PoC>",
-      "attempts":   <int>,
-      "model":      "<model id or 'hardcoded'>",
-      "verdict":    "green" | "red" | "still_red" | "regression" | "not_exploitable",
-      "timestamp":  "<iso8601>",
-      "signature":  {
-        "alg":  "ed25519",
-        "key_id": "<sha256 of pubkey>",
-        "value": "<base64 signature over canonical JSON>"
-      } or null
-    }
+Emits an in-toto Statement (v1) with a custom predicate
+`patchproof/exploit-verified/v0.1`. The predicate records the PoC digest, the
+pre-patch and post-patch exploit outcomes, variant-PoC results, and the
+regression-test result. Labels are deliberately honest: a green run proves the
+exploit (and its variants) is blocked and tests pass, NOT that the patch is
+semantically correct. `semantic_review` is always "none" unless a human signs.
 
-Signing is optional. Pass `private_key=<ed25519 PrivateKey>` to sign.
+Optionally emits a companion OpenVEX document marking the vuln `fixed`.
 """
 from __future__ import annotations
 
-import base64
-import datetime as _dt
 import hashlib
 import json
-from dataclasses import asdict, dataclass, field
+import time
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+
+PREDICATE_TYPE = "https://patchproof.dev/attestation/exploit-verified/v0.1"
+STATEMENT_TYPE = "https://in-toto.io/Statement/v1"
+
+
+@dataclass
+class VariantOutcome:
+    label: str
+    blocked: bool
+
+
+@dataclass
+class ExploitVerifiedPredicate:
+    tool: str
+    tool_version: str
+    timestamp: str
+    poc_sha256: str
+    poc_kind: str
+    pre_patch_exploit_succeeded: bool
+    post_patch_exploit_blocked: bool
+    variants_total: int
+    variants_blocked: int
+    variant_results: list[VariantOutcome]
+    regression_passed: bool
+    regression_note: str
+    runner: str
+    model: str
+    attempts: int
+    semantic_review: str = "none"
+    disclaimer: str = (
+        "A green verdict proves the supplied exploit and its generated variants "
+        "no longer succeed and the app's tests still pass. It does NOT prove the "
+        "patch is semantically correct or complete; independent review of untested "
+        "and variant-adjacent behavior is still required."
+    )
 
 
 @dataclass
 class Attestation:
-    target_sha: str
-    poc_sha: str
-    attempts: int
-    model: str
-    verdict: str
-    timestamp: str = field(default_factory=lambda: _dt.datetime.now(_dt.UTC).isoformat())
-    signature: dict | None = None
+    subject_name: str
+    subject_sha256: str
+    predicate: ExploitVerifiedPredicate
+
+    def to_statement(self) -> dict:
+        return {
+            "_type": STATEMENT_TYPE,
+            "subject": [{"name": self.subject_name, "digest": {"sha256": self.subject_sha256}}],
+            "predicateType": PREDICATE_TYPE,
+            "predicate": asdict(self.predicate),
+        }
 
 
-def _canonical_json(data: dict) -> bytes:
-    """Stable JSON for signing/verification."""
-    return json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
+def now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def sign_attestation(att: Attestation, private_key: Any) -> None:
-    """Sign the attestation in-place. `private_key` is a cryptography ed25519 key."""
-    payload = asdict(att)
-    payload.pop("signature", None)
-    canon = _canonical_json(payload)
-    sig = private_key.sign(canon)
-    pub = private_key.public_key().public_bytes_raw()
-    att.signature = {
-        "alg": "ed25519",
-        "key_id": hashlib.sha256(pub).hexdigest(),
-        "value": base64.b64encode(sig).decode("ascii"),
-    }
+def tree_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    for p in sorted(Path(path).rglob("*")):
+        if p.is_file() and not any(x in p.parts for x in ("__pycache__", ".git", "node_modules", "venv", ".venv")):
+            h.update(p.relative_to(path).as_posix().encode())
+            h.update(p.read_bytes())
+    return h.hexdigest()
 
 
 def write_attestation(att: Attestation, path: Path) -> None:
-    path.write_text(json.dumps(asdict(att), indent=2, sort_keys=True))
+    Path(path).write_text(json.dumps(att.to_statement(), indent=2, sort_keys=True))
 
 
-def load_attestation(path: Path) -> Attestation:
-    data = json.loads(path.read_text())
-    return Attestation(**data)
-
-
-def verify_signature(att: Attestation, public_key: Any) -> bool:
-    if not att.signature:
-        return False
-    payload = asdict(att)
-    payload.pop("signature", None)
-    try:
-        sig = base64.b64decode(att.signature["value"])
-        public_key.verify(sig, _canonical_json(payload))
-        return True
-    except Exception:  # noqa: BLE001
-        return False
-
-
-__all__ = ["Attestation", "load_attestation", "sign_attestation", "verify_signature", "write_attestation"]
+def write_openvex(*, path: Path, vuln_id: str, product: str, status: str = "fixed") -> None:
+    doc = {
+        "@context": "https://openvex.dev/ns/v0.2.0",
+        "@id": f"https://patchproof.dev/vex/{int(time.time())}",
+        "author": "patchproof",
+        "timestamp": now_iso(),
+        "version": 1,
+        "statements": [
+            {"vulnerability": {"name": vuln_id}, "products": [{"@id": product}], "status": status}
+        ],
+    }
+    Path(path).write_text(json.dumps(doc, indent=2, sort_keys=True))

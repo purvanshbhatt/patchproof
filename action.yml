@@ -19,7 +19,7 @@ inputs:
     description: "Unified diff to verify."
     required: true
   python-version:
-    description: "Python version used to install patchproof-repro."
+    description: "Python version used to install patchproof."
     required: false
     default: "3.12"
 
@@ -32,7 +32,7 @@ runs:
 
     - name: Install PatchProof
       shell: bash
-      run: pip install patchproof-repro
+      run: pip install patchproof
 
     - name: Red baseline (PoC must reproduce)
       shell: bash

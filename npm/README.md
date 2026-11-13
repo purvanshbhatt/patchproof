@@ -1,11 +1,11 @@
 # patchproof-repro (npm)
 
-Thin npm wrapper around the Python CLI [`patchproof-repro`](https://pypi.org/project/patchproof-repro/).
+Thin npm wrapper around the Python CLI [`patchproof`](https://pypi.org/project/patchproof/).
 
 `npx patchproof` will:
 
 1. Find a Python ≥ 3.11 interpreter (override with `PATCHPROOF_PYTHON`).
-2. `pip install --user patchproof-repro` if it's missing (opt out: `PATCHPROOF_SKIP_INSTALL=1`).
+2. `pip install --user patchproof` if it's missing (opt out: `PATCHPROOF_SKIP_INSTALL=1`).
 3. Forward all arguments to the real `patchproof` CLI.
 
 ## Usage

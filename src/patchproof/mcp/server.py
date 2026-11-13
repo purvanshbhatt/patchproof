@@ -1,8 +1,10 @@
 """PatchProof MCP server.
 
-Exposes a single tool `patchproof_run` so MCP-aware editors (Cursor, Claude
-Code) can hand a vulnerable file + PoC to the engine and receive a verified
-.patch plus an attestation.
+Exposes two tools so MCP-aware editors (Cursor, Claude Code) can drive the
+engine: ``patchproof_run`` executes the full red->green loop (optionally
+generating the patch with an LLM), and ``patchproof_verify`` checks a committed
+patch. Both run the exploit by execution and write their evidence, attestation,
+and regression artifacts under ``patchproof-out/<run-id>/``.
 
 Run standalone:
     python -m patchproof.mcp.server
@@ -27,7 +29,17 @@ from pathlib import Path
 from typing import Any
 
 SERVER_NAME = "patchproof"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.2.0"
+
+# Maps a pipeline exit code to a human-readable verdict. These mirror the exit
+# codes documented in patchproof.pipeline and surfaced by the CLI.
+_VERDICTS = {
+    0: "exploit-verified (exploit and variants blocked, tests pass) or not exploitable",
+    2: "failed to patch (exploit still succeeds)",
+    3: "patch broke regression tests",
+    4: "patch did not apply",
+    5: "weak patch (base blocked, but a variant still succeeds)",
+}
 
 
 def _tool_definitions() -> list[dict]:
@@ -35,8 +47,10 @@ def _tool_definitions() -> list[dict]:
         {
             "name": "patchproof_run",
             "description": (
-                "Run the PatchProof red→green loop against an app path and PoC. "
-                "Returns the verdict, attempt count, and paths to the patch + attestation."
+                "Run the PatchProof red->green loop against an app path and PoC. "
+                "Returns the exit code and verdict; evidence, the patch, the "
+                "attestation, and regression artifacts are written under "
+                "patchproof-out/<run-id>/."
             ),
             "inputSchema": {
                 "type": "object",
@@ -45,17 +59,23 @@ def _tool_definitions() -> list[dict]:
                     "poc_path": {"type": "string", "description": "Path to PoC exploit file."},
                     "hardcoded_patch": {
                         "type": "string",
-                        "description": "Optional diff to verify without LLM.",
+                        "description": "Optional diff to verify without an LLM.",
                     },
                     "max_attempts": {"type": "integer", "default": 5},
-                    "model": {"type": "string", "default": "gpt-4o-mini"},
+                    "model": {"type": "string", "default": "anthropic/claude-sonnet-4-5"},
+                    "runner": {
+                        "type": "string",
+                        "enum": ["auto", "local", "docker"],
+                        "default": "auto",
+                        "description": "Sandbox backend for serving the app and replaying the PoC.",
+                    },
                 },
                 "required": ["app_path", "poc_path"],
             },
         },
         {
             "name": "patchproof_verify",
-            "description": "Apply a patch and verify it blocks the PoC without regressions.",
+            "description": "Apply a committed patch and verify it blocks the PoC and its variants without regressions.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -73,20 +93,23 @@ async def _dispatch(name: str, arguments: dict) -> dict:
     from ..pipeline import Pipeline, verify_only
 
     if name == "patchproof_run":
-        p = Pipeline(
+        pipeline = Pipeline(
             app_path=Path(arguments["app_path"]),
             poc=Path(arguments["poc_path"]),
-            hardcoded_patch=Path(arguments["hardcoded_patch"]) if arguments.get("hardcoded_patch") else None,
+            hardcoded_patch=(
+                Path(arguments["hardcoded_patch"])
+                if arguments.get("hardcoded_patch")
+                else None
+            ),
             max_attempts=int(arguments.get("max_attempts", 5)),
-            model=arguments.get("model", "gpt-4o-mini"),
+            model=arguments.get("model", "anthropic/claude-sonnet-4-5"),
+            runner_backend=arguments.get("runner", "auto"),
         )
-        result = p.run()
+        rc = pipeline.run()
         return {
-            "verdict": "green" if result.patch_path else "red",
-            "attempts": result.attempts,
-            "patch_path": str(result.patch_path) if result.patch_path else None,
-            "attestation_path": str(result.attestation_path) if result.attestation_path else None,
-            "artifacts": [str(a) for a in result.artifacts],
+            "returncode": rc,
+            "verdict": _VERDICTS.get(rc, "unknown"),
+            "out_dir": str(pipeline.out_dir),
         }
     if name == "patchproof_verify":
         rc = verify_only(
@@ -94,7 +117,7 @@ async def _dispatch(name: str, arguments: dict) -> dict:
             poc=Path(arguments["poc_path"]),
             patch_file=Path(arguments["patch_path"]),
         )
-        return {"returncode": rc, "verdict": "green" if rc == 0 else "failed"}
+        return {"returncode": rc, "verdict": _VERDICTS.get(rc, "unknown")}
     raise ValueError(f"unknown tool: {name}")
 
 

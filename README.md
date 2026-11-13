@@ -1,182 +1,160 @@
 # PatchProof
 
-[![PyPI](https://img.shields.io/pypi/v/patchproof-repro)](https://pypi.org/project/patchproof-repro/)
-[![npm](https://img.shields.io/npm/v/patchproof-repro)](https://www.npmjs.com/package/patchproof-repro)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
-![Python](https://img.shields.io/badge/python-3.11%2B-blue)
-[![GitHub stars](https://img.shields.io/github/stars/purvanshbhatt/patchproof?style=social)](https://github.com/purvanshbhatt/patchproof/stargazers)
+**Exploit-verified patching for web apps.** PatchProof reproduces an exploit
+against your app in a sandbox (red), applies a patch (yours or an LLM's),
+re-runs the exploit to prove it is blocked (green), replays mutated variants of
+the exploit, runs your regression tests, and emits a signed attestation plus a
+ready-to-run regression test.
 
-> **Deterministic exploit repro + AI patch verification engine.**
-> Bridging the gap between "we found a bug" and "we proved the fix works."
-
-<!-- Demo GIF: record with `vhs demo/demo.tape`, then uncomment:
-<p align="center">
-  <img src="demo/demo.gif" alt="PatchProof turning a red exploit into a green verified fix" width="100%">
-</p>
--->
-
-| | |
-|---|---|
-| 🔴 **Red** | PoC exploit succeeds against your app in an ephemeral Docker sandbox |
-| 🤖 **Patch** | LLM drafts a minimal unified diff; hot-reload inside the container |
-| 🟢 **Green** | Exact same PoC now fails; native test suite passes |
-| 📦 **Artifacts** | Merge-ready `.patch` + regression test + signed attestation |
-
-PatchProof takes a target source tree and a Proof-of-Concept exploit (curl,
-raw HTTP, Nuclei template, Python script), spins up an **ephemeral Docker
-sandbox**, confirms the exploit reproduces (🔴 **Red**), iteratively asks an
-LLM to draft a fix, hot-reloads the app, re-runs the exact same PoC, and
-emits a **verified `.patch` + regression test + signed attestation** when
-the exploit is blocked (🟢 **Green**) without breaking the rest of the test
-suite.
+The verdict is not "the scanner stopped complaining." It is **"the exploit no
+longer works, its variants no longer work, and your tests still pass"** —
+checked by execution, not by static analysis.
 
 ```
-   ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-   │  Ingest PoC │ →  │   Sandbox   │ →  │  Red state  │
-   └─────────────┘    └─────────────┘    └──────┬──────┘
-                                               ▼
-                                       ┌───────────────┐
-                                       │  AI patch loop│
-                                       │  (≤N attempts)│
-                                       └──────┬────────┘
-                                              ▼
-                              ┌──────────────────────────────┐
-                              ▼                              ▼
-                       ┌─────────────┐                ┌─────────────┐
-                       │ Still red?  │                │   Green ✔   │
-                       │  refine…    │                │ regression? │
-                       └─────────────┘                └──────┬──────┘
-                                                            ▼
-                                            ┌───────────────────────────┐
-                                            │ fix.patch + regression    │
-                                            │ test + signed attestation  │
-                                            └───────────────────────────┘
+red  ──▶  patch  ──▶  green  ──▶  variants  ──▶  regression  ──▶  attest
+exploit   apply       re-run      mutated        your tests      in-toto
+fires     diff        blocked?    PoCs blocked?   still pass?     statement
 ```
 
----
+## Why it exists
+
+Commercial AI auto-fix tools (Copilot Autofix, Snyk Agent Fix, Semgrep, Pixee,
+Veracode, Checkmarx) verify a fix by **re-running the static scanner** that
+raised the finding. That answers "does the pattern still match?", not "is the
+app still exploitable?". The research-grade definition of a verified
+patch — used by the DARPA AIxCC 2025 finalists and benchmarks like CyberGym,
+PatchEval, and Vul4J — is execution-based: a proof-of-vulnerability that worked
+before no longer works, *and* functional tests still pass.
+
+That execution-based bar exists for fuzzer crashes in C/C++ libraries. It does
+**not** exist as an easy-to-run, open tool for **deployed web apps with
+HTTP-level PoCs**. PatchProof fills that gap, and adds two things the research
+consensus says you need:
+
+- **Variant replay.** AIxCC required patches to block *all variant* PoVs,
+  because a patch that only blocks the exact payload (a WAF-style string check)
+  is over-fitted. PatchProof auto-mutates the PoC (case flips, URL-encoding,
+  comment splicing) and fails the patch if any variant still succeeds.
+- **Honest labels.** A fraction of patches that pass exploit-replay and tests
+  are still semantically wrong. PatchProof records `semantic_review: none` and
+  says so in the attestation, instead of claiming "fixed."
+
+See [docs/POSITIONING.md](docs/POSITIONING.md) for the full landscape.
 
 ## Install
 
-> PyPI/npm name: **`patchproof-repro`** (the `patchproof` names were taken).
-> Import as `patchproof`, run as `patchproof`.
+```bash
+pip install -e .            # or: uv pip install -e .
+```
+
+The `local` runner needs only Python. The `docker` runner needs a running
+Docker daemon.
+
+## Quickstart
 
 ```bash
-pip install patchproof-repro
-# or from source:
-git clone https://github.com/purvanshbhatt/patchproof
-cd patchproof
-uv pip install -e '.[all]'          # or: pip install -e '.[all]'
+patchproof run \
+  --app ./tests/fixtures/vuln-fastapi-sqli/app \
+  --poc ./tests/fixtures/vuln-fastapi-sqli/poc.txt \
+  --hardcoded-patch ./tests/fixtures/vuln-fastapi-sqli/fix.patch \
+  --runner local
 ```
 
-Requires a running Docker daemon.
-
-## CLI
+Drop `--hardcoded-patch` to have an LLM generate the patch (needs
+[LiteLLM](https://docs.litellm.ai/) credentials, e.g. `ANTHROPIC_API_KEY`):
 
 ```bash
-patchproof --help
-patchproof run   --app ./tests/fixtures/vuln-fastapi-sqli/app \
-                --poc ./tests/fixtures/vuln-fastapi-sqli/poc.txt
-patchproof run   --app ./my-app --poc ./sqli.curl --max-attempts 5 --model gpt-4o-mini
-patchproof verify --app ./my-app --poc ./sqli.curl --patch ./fix.patch
-patchproof init   # scaffold ./patchproof.toml
+patchproof run --app ./app --poc ./poc.txt --model anthropic/claude-sonnet-4-5
 ```
 
-Run artifacts land in `patchproof-out/<run-id>/`:
+## PoC formats
+
+PatchProof auto-detects and normalizes:
+
+- **curl** one-liners: `curl "http://host/?id=' OR '1'='1'"`
+- **raw HTTP** requests: `GET /admin?debug=1 HTTP/1.1` …
+- **Nuclei** templates (first request + matcher)
+- **Python** scripts (run inside the sandbox; print `EXPLOIT_OK` / `EXPLOIT_FAIL`)
+
+A leading directive line overrides the success oracle:
 
 ```
-fix.patch                     ← drop-in git diff
-attestation.json              ← signed evidence (target SHA + PoC SHA + verdict)
-evidence/red.json             ← red baseline response
-evidence/attempt_<n>.json     ← every retry
-test_security_patchproof.py   ← regression test, ready for CI
+#patchproof: marker=EXPLOIT_LEAK status=500
 ```
 
-## Use as a library
+## Verdicts
 
-```python
-from pathlib import Path
-from patchproof.pipeline import Pipeline
+| Verdict | Exit | Meaning |
+|---------|------|---------|
+| EXPLOIT-VERIFIED PATCH | 0 | exploit + variants blocked, tests pass |
+| NOT EXPLOITABLE | 0 | PoC did not reproduce; nothing to patch |
+| FAILED TO PATCH | 2 | exploit still succeeds after every attempt |
+| PATCH BROKE TESTS | 3 | exploit blocked but regression tests fail |
+| PATCH DID NOT APPLY | 4 | diff could not be applied |
+| WEAK PATCH | 5 | base blocked, but a variant still succeeds (over-fitted) |
 
-Pipeline(
-    app_path=Path("./my-app"),
-    poc=Path("./sqli.curl"),
-    max_attempts=5,
-    model="gpt-4o-mini",
-).run()
-```
+## CI gate
 
-## MCP server (Cursor / Claude Code)
-
-```jsonc
-{
-  "mcpServers": {
-    "patchproof": {
-      "command": "python",
-      "args": ["-m", "patchproof.mcp.server"],
-      "cwd": "<path to patchproof checkout>"
-    }
-  }
-}
-```
-
-Tools exposed:
-
-- `patchproof_run(app_path, poc_path, hardcoded_patch?, max_attempts?, model?)`
-- `patchproof_verify(app_path, poc_path, patch_path)`
-
-## CI / pre-commit
-
-### GitHub Action (on every PR)
+`verify` applies a committed patch, re-runs the exploit and its variants, and
+runs your tests. No LLM. Exit code 0 only if the exploit is truly blocked — wire
+it as a required check:
 
 ```yaml
-- uses: purvanshbhatt/patchproof@v0.1.0
-  with:
-    app-path: ./my-app
-    poc-path: .patchproof/poc.txt
-    patch-file: .patchproof/fix.patch
+- run: pip install patchproof
+- run: |
+    patchproof verify \
+      --app ./app --poc ./security/poc.txt --patch ./security/fix.patch \
+      --runner local
 ```
 
-### pre-commit framework
+A fuller example is in [docs/example-github-action.yml](docs/example-github-action.yml).
 
-```yaml
-# .pre-commit-config.yaml
-repos:
-  - repo: https://github.com/purvanshbhatt/patchproof
-    rev: v0.1.0
-    hooks:
-      - id: patchproof-verify   # expects .patchproof/{poc.txt,fix.patch}
-```
+## Output artifacts
 
-Or the plain shell hook: [`examples/hooks/pre-commit`](examples/hooks/pre-commit).
+Each run writes to `patchproof-out/<run-id>/`:
+
+- `fix.patch` — the effective patch (diff vs baseline)
+- `attestation.json` — an [in-toto](https://in-toto.io/) Statement with a
+  `patchproof/exploit-verified/v0.1` predicate: PoC digest, pre/post outcomes,
+  variant results, regression result, and an explicit disclaimer
+- `artifacts/test_patchproof_regression.py` — a pytest that replays the exploit
+- `artifacts/patchproof-regression.yaml` — a Nuclei template for the same
+- `evidence/` — raw red/green/attempt records
+
+Add `--emit-vex --vuln-id CVE-XXXX-NNNN` to also write an OpenVEX `fixed`
+statement.
+
+## Security
+
+PatchProof runs untrusted PoCs and vulnerable apps. The PoC is treated as data,
+the LLM never sees it raw, and the Docker runner uses `--network none`, no
+published port, dropped capabilities, and no Docker socket. See
+[SECURITY.md](SECURITY.md) for the full threat model and the limits of a green
+verdict.
 
 ## Architecture
 
-| module                       | role                                                     |
-|------------------------------|----------------------------------------------------------|
-| `ingest.normalize`           | curl / raw HTTP / Nuclei / Python → normalized `PoC`     |
-| `sandbox.app_spec`           | Detect runtime + framework, pick base image & reload cmd |
-| `sandbox.docker`             | Ephemeral container, hot-reload, exec PoC, run tests     |
-| `patch.locator`              | tree-sitter / regex → most likely vulnerable `file:line` |
-| `patch.llm`                  | LiteLLM → unified diff                                   |
-| `patch.apply`                | `git apply` (or hand-rolled) + snapshot rollback         |
-| `regression.runner`          | `docker exec` the framework test suite                   |
-| `report.attestation`         | JSON evidence + optional ed25519 signature               |
-| `report.tui`                 | Rich live display                                        |
+```
+patchproof/
+  ingest/normalize.py   PoC parsing, success oracle, variant generation
+  sandbox/app_spec.py   runtime/framework/entrypoint detection
+  sandbox/runner.py     LocalRunner + DockerRunner (serve, replay, test)
+  patch/apply.py        git-backed apply / rollback on a working copy
+  patch/locator.py      rank likely-vulnerable files for the generator
+  patch/llm.py          injection-safe LLM patch generation (LiteLLM)
+  report/attestation.py in-toto predicate + OpenVEX
+  report/tui.py         Rich progress output
+  pipeline.py           the red -> green -> attest orchestration
+```
 
 ## Development
 
 ```bash
-uv pip install -e '.[dev]'
-pytest -m 'not integration'          # unit tests (no Docker)
-pytest                                # all tests (needs Docker)
+pip install -e '.[dev]'
 ruff check src tests
+pytest
 ```
-
-## Roadmap & launch
-
-- [ROADMAP.md](ROADMAP.md) — community tier backlog + enterprise SaaS phases.
-- Launch post drafts for Show HN, Reddit, and awesome-lists: [`docs/launch/`](docs/launch/).
 
 ## License
 
-Apache-2.0.
+Apache-2.0. See [LICENSE](LICENSE).

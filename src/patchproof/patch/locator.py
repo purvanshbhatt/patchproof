@@ -1,135 +1,57 @@
-"""Locate the vulnerable code site in the target tree.
+"""Locate the most likely vulnerable file(s) to show the patch generator.
 
-Strategy:
-1. Grep the source tree for the route referenced by the PoC payload.
-2. If found, scan the enclosing function for sink patterns (raw SQL, eval,
-   os.system, subprocess shell=True, request args flowing to sinks).
-3. Fall back to "first file with a matching route" when static analysis fails.
-
-The locator returns a precise `file:line` plus a small code window around it so
-the LLM can craft a minimal diff.
+Best-effort: scan the working copy for source files and rank them by signals in
+the exploit response and by risky sink patterns. Returns a list of
+(relative_path, snippet) candidates, most-likely first.
 """
 from __future__ import annotations
 
-import re
-from dataclasses import dataclass
 from pathlib import Path
 
-from ..ingest.normalize import PoCResult
+from ..ingest.normalize import ExploitResult
+
+_RISKY = (
+    "execute(", "executemany(", "cursor.execute", "f\"SELECT", "f'SELECT",
+    "os.system(", "subprocess.", "eval(", "exec(", "pickle.loads",
+    "render_template_string", "send_file(", "open(", "yaml.load(",
+    "child_process", "innerHTML", "res.send(",
+)
+_SRC_EXT = {".py", ".js", ".ts", ".go", ".rb", ".php"}
+_IGNORE = {"__pycache__", "node_modules", ".git", ".venv", "venv", "tests"}
 
 
-@dataclass
-class PatchTarget:
-    file: Path
-    line: int
-    snippet: str
-    route: str = ""
-    sink: str = ""
-
-    def __str__(self) -> str:
-        rel = self.file
-        try:
-            rel = self.file.relative_to(Path.cwd())
-        except ValueError:
-            pass
-        return f"{rel}:{self.line}"
-
-
-_SINK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
-    ("sql_concat", re.compile(r"""(execute|f"SELECT|f'SELECT|\bSELECT\s+.*\+|cursor\.execute\([^,]*%s|where\s+['\"]?\s*\+|text\(['\"]\s*SELECT)""")),
-    ("sql_string_format", re.compile(r"""(\.execute\([^)]*%[^)]*\)|\.execute\(f['\"])""")),
-    ("shell", re.compile(r"""\bos\.(system|popen)\(|\bsubprocess\.(call|run|Popen)\([^)]*shell\s*=\s*True""")),
-    ("eval", re.compile(r"""\beval\s*\(|\bexec\s*\(""")),
-    ("deserialization", re.compile(r"""\b(pickle|yaml\.load|jsonpickle)\.(loads?|decode)\(""")),
-]
-
-
-def _route_from_poc(result: PoCResult) -> str:
-    url = result.request.get("url", "")
-    return url.split("?", 1)[0]
-
-
-def _find_route_file(app_path: Path, route: str) -> Path | None:
-    """Find the first source file that registers the given route."""
-    needle_decorators = [
-        re.compile(rf'@\s*\w+\.(get|post|put|delete|patch|route)\(\s*["\']{re.escape(route)}["\']'),
-        re.compile(rf'\.(get|post|put|delete|patch)\(\s*["\']?{re.escape(route)}["\']?'),
-    ]
-    for p in app_path.rglob("*.py"):
-        if "__pycache__" in str(p) or "node_modules" in str(p):
+def locate(red: ExploitResult, workdir: Path, max_files: int = 3, max_bytes: int = 6000) -> list[dict]:
+    workdir = Path(workdir)
+    scored: list[tuple[int, Path]] = []
+    hint = (red.body or "").lower()
+    for p in workdir.rglob("*"):
+        if not p.is_file() or p.suffix not in _SRC_EXT:
+            continue
+        if any(part in _IGNORE for part in p.parts):
             continue
         try:
             text = p.read_text()
-        except Exception:  # noqa: BLE001
+        except Exception:
             continue
-        for pat in needle_decorators:
-            if pat.search(text):
-                return p
-    return None
-
-
-def _function_span(text: str, line_no: int) -> tuple[int, int]:
-    """Return (start_line, end_line) of the function containing line_no (1-indexed)."""
-    lines = text.splitlines()
-    start = line_no - 1
-    # walk up to find the `def` / `async def`
-    while start >= 0 and not re.match(r"^\s*(async\s+def|def)\s", lines[start]):
-        start -= 1
-    if start < 0:
-        return (line_no, line_no)
-    # walk down to the next dedented line
-    base_indent = len(lines[start]) - len(lines[start].lstrip())
-    end = start + 1
-    while end < len(lines):
-        line = lines[end]
-        if line.strip() == "":
-            end += 1
-            continue
-        indent = len(line) - len(line.lstrip())
-        if indent <= base_indent:
-            break
-        end += 1
-    return (start + 1, end)
-
-
-def _best_sink_line(text: str, span: tuple[int, int]) -> tuple[int, str]:
-    lines = text.splitlines()
-    start, end = span
-    for i in range(start - 1, min(end, len(lines))):
-        line = lines[i]
-        for name, pat in _SINK_PATTERNS:
-            if pat.search(line):
-                return i + 1, name
-    # fallback: middle of the function
-    return (start + end) // 2, "unknown"
-
-
-def locate(red_result: PoCResult, app_path: Path) -> PatchTarget:
-    """Find the most likely vulnerable site given the red PoC result."""
-    route = _route_from_poc(red_result)
-    py_file = _find_route_file(app_path, route)
-    if py_file is None:
-        # pick any python file
-        for p in app_path.rglob("*.py"):
-            if "__pycache__" not in str(p):
-                py_file = p
+        score = sum(text.count(sig) for sig in _RISKY)
+        if p.name in ("main.py", "app.py", "app.js", "server.js", "index.js"):
+            score += 2
+        # Traceback filename reflected in the response raises the score.
+        if p.name.lower() in hint:
+            score += 5
+        if score:
+            scored.append((score, p))
+    scored.sort(key=lambda t: t[0], reverse=True)
+    out: list[dict] = []
+    for _, p in scored[:max_files]:
+        rel = p.relative_to(workdir).as_posix()
+        out.append({"path": rel, "content": p.read_text()[:max_bytes]})
+    if not out:
+        # Fallback to the entrypoint-ish file so the generator still has context.
+        for name in ("main.py", "app.py", "app.js", "server.js", "index.js"):
+            cand = next((q for q in workdir.rglob(name)), None)
+            if cand:
+                out.append({"path": cand.relative_to(workdir).as_posix(),
+                            "content": cand.read_text()[:max_bytes]})
                 break
-    if py_file is None:
-        return PatchTarget(file=app_path, line=1, snippet="", route=route)
-
-    text = py_file.read_text()
-    # heuristic: sink line search inside the function that handles the route
-    span = _function_span(text, 1)
-    # if the route's decorator line is known, anchor on it
-    decorator = re.search(rf'@\s*\w+\.(?:get|post|put|delete|patch)\(\s*["\']{re.escape(route)}', text)
-    if decorator:
-        line_no = text[: decorator.start()].count("\n") + 1
-        span = _function_span(text, line_no + 1)
-    sink_line, sink_name = _best_sink_line(text, span)
-
-    lines = text.splitlines()
-    lo = max(0, sink_line - 6)
-    hi = min(len(lines), sink_line + 5)
-    snippet = "\n".join(lines[lo:hi])
-
-    return PatchTarget(file=py_file, line=sink_line, snippet=snippet, route=route, sink=sink_name)
+    return out

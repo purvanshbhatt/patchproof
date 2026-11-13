@@ -29,13 +29,13 @@ Artifacts emitted per run: a merge-ready `.patch`, an auto-generated pytest
 regression test that locks the exploit scenario into CI forever, and a JSON
 attestation with SHA-256 of target + PoC (optionally ed25519-signed).
 
-It's MIT-style Apache-2.0, installable via `pip install patchproof-repro` or
+It's MIT-style Apache-2.0, installable via `pip install patchproof` or
 `npx patchproof`, usable as a library, a pre-commit hook, a GitHub Action, and
 an MCP server for Cursor/Claude Code.
 
 Try it in 60 seconds against the bundled vulnerable FastAPI fixture:
 
-    pip install patchproof-repro
+    pip install patchproof
     patchproof run --app ./tests/fixtures/vuln-fastapi-sqli/app \
                    --poc ./tests/fixtures/vuln-fastapi-sqli/poc.txt
 

@@ -1,187 +1,306 @@
-"""PoC ingestion + normalization."""
+"""PoC ingestion, normalization, and variant generation.
+
+A PoC is treated as *untrusted data*. Its text is never injected verbatim into
+an LLM prompt (see patch.llm) and is never executed as a shell command on the
+host. HTTP/curl/nuclei PoCs are replayed over the wire; python PoCs run inside
+the sandbox runner, not on the host.
+"""
 from __future__ import annotations
 
 import hashlib
 import json
 import re
-from collections.abc import Callable
 from dataclasses import dataclass, field
-from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
-
-@dataclass
-class PoC:
-    kind: str  # "http" | "python" | "nuclei" | "curl"
-    payload: dict = field(default_factory=dict)  # method/url/headers/body or command
-    success_predicate: Callable[[httpx.Response], bool] = field(default=lambda r: False)
-
-    def sha256(self) -> str:
-        return hashlib.sha256(
-            json.dumps(self.payload, sort_keys=True).encode()
-        ).hexdigest()
-
-    def run(self, base_url: str, timeout: float = 5.0) -> PoCResult:
-        url = self.payload.get("url", "")
-        if not url.startswith("http"):
-            url = base_url.rstrip("/") + url
-        method = self.payload.get("method", "GET").upper()
-        headers = self.payload.get("headers", {})
-        body = self.payload.get("body")
-        with httpx.Client(timeout=timeout) as client:
-            resp = client.request(method, url, headers=headers, content=body)
-        return PoCResult(
-            request={
-                "method": method,
-                "url": url,
-                "headers": headers,
-                "body": body,
-            },
-            response_status=resp.status_code,
-            response_text=resp.text,
-            response_headers=dict(resp.headers),
-            exploit_succeeded=self.success_predicate(resp),
-        )
+# Markers that, if reflected in a response body, indicate a successful exploit
+# for the bundled fixtures and common leak-style PoCs. Case-insensitive.
+DEFAULT_LEAK_MARKERS = ("EXPLOIT_LEAK", "admin_password", "root:x:0:0", "/etc/passwd")
 
 
 @dataclass
-class PoCResult:
+class Oracle:
+    """Decides whether a response proves the exploit worked.
+
+    An exploit "succeeds" when ANY configured signal fires:
+      - status code >= 500 (unhandled crash), when crash_is_success
+      - status code equals an explicit expected_status
+      - any marker string is present in the body
+    """
+
+    markers: tuple[str, ...] = DEFAULT_LEAK_MARKERS
+    expected_status: int | None = None
+    crash_is_success: bool = True
+
+    def judge(self, status: int, body: str) -> bool:
+        if self.expected_status is not None and status == self.expected_status:
+            return True
+        if self.crash_is_success and status >= 500:
+            return True
+        low = body.lower()
+        return any(m.lower() in low for m in self.markers)
+
+
+@dataclass
+class ExploitResult:
     request: dict
-    response_status: int
-    response_text: str
-    response_headers: dict
-    exploit_succeeded: bool
-    raw_response: str = ""
+    status: int
+    body: str
+    headers: dict
+    succeeded: bool
+    note: str = ""
 
-    def __post_init__(self) -> None:
-        self.raw_response = (
-            f"HTTP {self.response_status}\n"
-            + "\n".join(f"{k}: {v}" for k, v in self.response_headers.items())
-            + "\n\n"
-            + self.response_text
-        )
+    @property
+    def raw_response(self) -> str:
+        head = "\n".join(f"{k}: {v}" for k, v in self.headers.items())
+        return f"HTTP {self.status}\n{head}\n\n{self.body}"
 
     def as_json(self) -> str:
         return json.dumps(
             {
                 "request": self.request,
-                "response_status": self.response_status,
-                "response_text": self.response_text[:4000],
-                "response_headers": dict(self.response_headers),
-                "exploit_succeeded": self.exploit_succeeded,
+                "status": self.status,
+                "body": self.body[:4000],
+                "headers": dict(self.headers),
+                "succeeded": self.succeeded,
+                "note": self.note,
             },
             indent=2,
+            sort_keys=True,
         )
 
 
-def _default_predicate(needle: str) -> Callable[[httpx.Response], bool]:
-    def _p(r: httpx.Response) -> bool:
-        if r.status_code >= 500:
-            return True
-        return needle.lower() in r.text.lower()
-    return _p
+@dataclass
+class PoC:
+    kind: str  # "http" | "curl" | "nuclei" | "python"
+    payload: dict = field(default_factory=dict)
+    oracle: Oracle = field(default_factory=Oracle)
+    label: str = "base"
+
+    def sha256(self) -> str:
+        return hashlib.sha256(
+            json.dumps({"kind": self.kind, "payload": self.payload}, sort_keys=True).encode()
+        ).hexdigest()
+
+    def _abs_url(self, base_url: str) -> str:
+        url = self.payload.get("url", "/")
+        if url.startswith("http://") or url.startswith("https://"):
+            # Rehost onto the sandbox base_url; keep path + query only.
+            parts = urlsplit(url)
+            base = urlsplit(base_url)
+            return urlunsplit((base.scheme, base.netloc, parts.path, parts.query, ""))
+        return base_url.rstrip("/") + "/" + url.lstrip("/")
+
+    def run_http(self, base_url: str, timeout: float = 10.0) -> ExploitResult:
+        url = self._abs_url(base_url)
+        method = self.payload.get("method", "GET").upper()
+        headers = self.payload.get("headers", {})
+        body = self.payload.get("body")
+        try:
+            with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+                resp = client.request(method, url, headers=headers, content=body)
+            succeeded = self.oracle.judge(resp.status_code, resp.text)
+            return ExploitResult(
+                request={"method": method, "url": url, "headers": headers, "body": body},
+                status=resp.status_code,
+                body=resp.text,
+                headers=dict(resp.headers),
+                succeeded=succeeded,
+            )
+        except httpx.RequestError as e:
+            # A connection error is NOT a successful exploit; report it.
+            return ExploitResult(
+                request={"method": method, "url": url, "headers": headers, "body": body},
+                status=0,
+                body=str(e),
+                headers={},
+                succeeded=False,
+                note="request_error",
+            )
+
+    def variants(self) -> list[PoC]:
+        """Generate cheap payload variants (AIxCC-style variant PoVs) that a
+        correct fix must also block. Over-fitted string blocks pass the base
+        PoC but fail these. HTTP/curl only.
+        """
+        if self.kind not in ("http", "curl", "nuclei"):
+            return []
+        url = self.payload.get("url", "/")
+        if "?" not in url:
+            return []
+        path, _, query = url.partition("?")
+        out: list[PoC] = []
+
+        def _mk(new_query: str, label: str) -> PoC:
+            p = dict(self.payload)
+            p["url"] = f"{path}?{new_query}"
+            return PoC(kind=self.kind, payload=p, oracle=self.oracle, label=label)
+
+        # 1. Upper/lower case flip of the query (defeats case-sensitive blocks).
+        flipped = "".join(c.lower() if c.isupper() else c.upper() for c in query)
+        if flipped != query:
+            out.append(_mk(flipped, "case-flip"))
+        # 2. URL-encode the single quotes (defeats literal "'" blocks).
+        if "'" in query:
+            out.append(_mk(query.replace("'", "%27"), "url-encoded-quote"))
+        # 3. Inline comment splice for SQL-ish payloads.
+        if " OR " in query.upper():
+            out.append(_mk(re.sub(r"(?i) OR ", "/**/OR/**/", query), "comment-splice"))
+        return out
+
+
+# --------------------------------------------------------------------------- #
+# Parsing
+# --------------------------------------------------------------------------- #
+def _split_curl_args(text: str) -> list[str]:
+    return re.findall(r"""'[^']*'|"[^"]*"|\S+""", text)
+
+
+def _strip(tok: str) -> str:
+    if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in "'\"":
+        return tok[1:-1]
+    return tok
 
 
 def _parse_curl(text: str) -> dict:
-    """Minimal curl parser: handles `curl -X POST URL [-d 'body'] [-H 'k: v']`."""
-    args = re.findall(r"""('[^']*'|"[^"]*"|\S+)""", text)
-    if args and args[0] == "curl":
+    args = _split_curl_args(text)
+    if args and _strip(args[0]) == "curl":
         args = args[1:]
-    method = "GET"
-    url = ""
+    method, url, body = "GET", "", None
     headers: dict[str, str] = {}
-    body: str | None = None
     i = 0
     while i < len(args):
-        a = args[i].strip("'\"")
-        if a in ("-X", "--request"):
-            method = args[i + 1].strip("'\"")
+        a = _strip(args[i])
+        if a in ("-X", "--request") and i + 1 < len(args):
+            method = _strip(args[i + 1])
             i += 2
-        elif a in ("-H", "--header"):
-            kv = args[i + 1].strip("'\"")
+        elif a in ("-H", "--header") and i + 1 < len(args):
+            kv = _strip(args[i + 1])
             if ":" in kv:
                 k, v = kv.split(":", 1)
                 headers[k.strip()] = v.strip()
             i += 2
-        elif a in ("-d", "--data", "--data-raw"):
-            body = args[i + 1].strip("'\"")
+        elif a in ("-d", "--data", "--data-raw", "--data-binary") and i + 1 < len(args):
+            body = _strip(args[i + 1])
             if method == "GET":
                 method = "POST"
             i += 2
         elif a.startswith("-"):
-            i += 2 if i + 1 < len(args) else 1
+            i += 1
         else:
             url = a
             i += 1
     return {"method": method, "url": url, "headers": headers, "body": body}
 
 
-def _detect(text: str) -> tuple[str, dict, Callable]:
-    s = text.strip()
-    if s.startswith("curl "):
-        parsed = _parse_curl(s)
-        return "curl", parsed, _default_predicate("error")
-    if s.startswith(("GET ", "POST ", "PUT ", "DELETE ", "PATCH ", "HEAD ", "OPTIONS ")):
-        # raw HTTP request line
-        lines = s.splitlines()
-        parts = lines[0].split(" ")
-        method, path = parts[0], parts[1]
-        headers: dict[str, str] = {}
-        body_start = len(lines)
-        for idx, line in enumerate(lines[1:], start=1):
-            if not line.strip():
-                body_start = idx + 1
-                break
-            if ":" in line:
-                k, v = line.split(":", 1)
-                headers[k.strip()] = v.strip()
-        body = "\n".join(lines[body_start:]) if body_start < len(lines) else None
-        return "http", {"method": method, "url": path, "headers": headers, "body": body}, _default_predicate("error")
-    if s.startswith("{") and any(
-        k in s.lower() for k in ('"nuclei"', '"matchers"', '"template', '"extractor')
-    ):
-        # nuclei template — coarse parse
+def _parse_raw_http(text: str) -> dict:
+    lines = text.splitlines()
+    method, path, *_ = (lines[0].split(" ") + ["", ""])[:3]
+    headers: dict[str, str] = {}
+    body_lines: list[str] = []
+    in_body = False
+    for line in lines[1:]:
+        if in_body:
+            body_lines.append(line)
+        elif not line.strip():
+            in_body = True
+        elif ":" in line:
+            k, v = line.split(":", 1)
+            headers[k.strip()] = v.strip()
+    body = "\n".join(body_lines) if body_lines else None
+    return {"method": method.upper(), "url": path, "headers": headers, "body": body}
+
+
+def _parse_nuclei(text: str) -> tuple[dict, Oracle]:
+    """Coarse Nuclei YAML/JSON parse: first request + first matcher."""
+    import yaml  # pyyaml is a dependency
+
+    data = yaml.safe_load(text)
+    reqs = data.get("http") or data.get("requests") or []
+    payload = {"method": "GET", "url": "/", "headers": {}, "body": None}
+    oracle = Oracle()
+    if reqs:
+        r0 = reqs[0]
+        payload["method"] = (r0.get("method") or "GET").upper()
+        paths = r0.get("path") or ["/"]
+        raw = paths[0] if isinstance(paths, list) else paths
+        payload["url"] = raw.replace("{{BaseURL}}", "").replace("{{Hostname}}", "") or "/"
+        markers: list[str] = []
+        status: int | None = None
+        for m in r0.get("matchers", []):
+            if m.get("type") == "word":
+                markers += m.get("words", [])
+            elif m.get("type") == "status":
+                codes = m.get("status", [])
+                if codes:
+                    status = int(codes[0])
+        if markers:
+            oracle = Oracle(markers=tuple(markers), expected_status=status)
+        elif status is not None:
+            oracle = Oracle(markers=(), expected_status=status, crash_is_success=False)
+    return payload, oracle
+
+
+def load_poc(path) -> PoC:
+    """Load a PoC file and normalize it. Auto-detects curl / raw HTTP / nuclei /
+    python. A leading `#patchproof:` directive line may override the oracle, e.g.
+
+        #patchproof: marker=EXPLOIT_LEAK status=500
+    """
+    text = _read(path)
+    oracle_override = _parse_directive(text)
+
+    stripped = _strip_directive(text).strip()
+    first = stripped.split("\n", 1)[0].strip()
+
+    if first.startswith("curl"):
+        payload = _parse_curl(stripped)
+        return PoC("curl", payload, oracle_override or Oracle())
+    if re.match(r"^(GET|POST|PUT|DELETE|PATCH|HEAD) ", first):
+        payload = _parse_raw_http(stripped)
+        return PoC("http", payload, oracle_override or Oracle())
+    if "requests" in stripped and "matchers" in stripped or first in ("id:", "info:"):
         try:
-            data = json.loads(s)
-            reqs = data.get("requests", [])
-            if reqs:
-                r0 = reqs[0]
-                method = (r0.get("method") or "GET").upper()
-                raw_path = r0.get("path")
-                if isinstance(raw_path, (list, tuple)):
-                    path = raw_path[0] if raw_path else "/"
-                else:
-                    path = raw_path or "/"
-                matchers = r0.get("matchers", [])
-                needle = ""
-                for m in matchers:
-                    if m.get("type") == "word":
-                        words = m.get("words") or m.get("raw") or []
-                        if words:
-                            needle = words[0]
-                            break
-                    if m.get("type") == "status":
-                        codes = m.get("status", [200])
-                        code = int(codes[0]) if isinstance(codes, (list, tuple)) else int(codes)
-
-                        def _status_pred(r: httpx.Response, _code: int = code) -> bool:
-                            return r.status_code == _code
-
-                        return (
-                            "nuclei",
-                            {"method": method, "url": path, "headers": {}, "body": None},
-                            _status_pred,
-                        )
-                return "nuclei", {"method": method, "url": path, "headers": {}, "body": None}, _default_predicate(needle or "error")
+            payload, parsed_oracle = _parse_nuclei(stripped)
+            return PoC("nuclei", payload, oracle_override or parsed_oracle)
         except Exception:
             pass
-    # fallback: python
-    return "python", {"script": s}, _default_predicate("error")
+    return PoC("python", {"script": stripped}, oracle_override or Oracle())
 
 
-def load_poc(path: Path) -> PoC:
-    """Load a PoC from disk and return a normalized PoC object."""
-    text = path.read_text()
-    kind, payload, predicate = _detect(text)
-    return PoC(kind=kind, payload=payload, success_predicate=predicate)
+def _read(path) -> str:
+    try:
+        return path.read_text()
+    except AttributeError:
+        with open(path) as f:
+            return f.read()
+
+
+_DIRECTIVE = re.compile(r"^#patchproof:\s*(.+)$", re.MULTILINE)
+
+
+def _parse_directive(text: str) -> Oracle | None:
+    m = _DIRECTIVE.search(text)
+    if not m:
+        return None
+    markers: list[str] = []
+    status: int | None = None
+    crash = True
+    for tok in m.group(1).split():
+        if tok.startswith("marker="):
+            markers.append(tok[len("marker="):])
+        elif tok.startswith("status="):
+            status = int(tok[len("status="):])
+        elif tok == "no-crash":
+            crash = False
+    return Oracle(
+        markers=tuple(markers) if markers else DEFAULT_LEAK_MARKERS,
+        expected_status=status,
+        crash_is_success=crash,
+    )
+
+
+def _strip_directive(text: str) -> str:
+    return _DIRECTIVE.sub("", text)
