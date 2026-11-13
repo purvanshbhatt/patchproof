@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# PatchProof pre-commit hook.
+#
+# Install:
+#   ln -sf ../../examples/hooks/pre-commit .git/hooks/pre-commit
+#
+# Reads vulnerability reports staged under .patchproof/*.json and verifies each
+# one against the current source tree. Exits non-zero on red/regression so the
+# commit is blocked until the author regenerates with `patchproof run`.
+
+set -euo pipefail
+
+REPORTS=$(git diff --cached --name-only --diff-filter=AM | grep -E '\.patchproof/.*\.json$' || true)
+if [ -z "${REPORTS}" ]; then
+  exit 0
+fi
+
+for r in ${REPORTS}; do
+  APP_PATH=$(jq -r '.app_path // empty' "${r}")
+  POC_PATH=$(jq -r '.poc_path // empty' "${r}")
+  PATCH_PATH=$(jq -r '.patch_path // empty' "${r}")
+  if [ -z "${APP_PATH}" ] || [ -z "${POC_PATH}" ] || [ -z "${PATCH_PATH}" ]; then
+    echo "patchproof: skipping ${r} (missing fields)"
+    continue
+  fi
+  echo "patchproof: verifying ${r}"
+  patchproof verify --app "${APP_PATH}" --poc "${POC_PATH}" --patch "${PATCH_PATH}"
+done

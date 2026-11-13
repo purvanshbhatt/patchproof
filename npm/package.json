@@ -1,0 +1,42 @@
+{
+  "name": "patchproof-repro",
+  "version": "0.1.0",
+  "description": "Deterministic exploit repro + AI patch verification engine (npm wrapper for the Python CLI).",
+  "license": "Apache-2.0",
+  "author": "purvanshbhatt",
+  "homepage": "https://github.com/purvanshbhatt/patchproof#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/purvanshbhatt/patchproof.git",
+    "directory": "npm"
+  },
+  "bugs": {
+    "url": "https://github.com/purvanshbhatt/patchproof/issues"
+  },
+  "keywords": [
+    "security",
+    "exploit",
+    "poc",
+    "patch",
+    "verification",
+    "sast",
+    "dast",
+    "llm",
+    "docker",
+    "cli"
+  ],
+  "type": "commonjs",
+  "bin": {
+    "patchproof": "bin/patchproof.js"
+  },
+  "files": [
+    "bin/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

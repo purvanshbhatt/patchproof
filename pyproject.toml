@@ -24,6 +24,9 @@ dev = [
   "pytest-asyncio>=0.23",
   "ruff>=0.5",
 ]
+mcp = [
+  "mcp>=1.0",
+]
 
 [project.scripts]
 patchproof = "patchproof.cli:app"
@@ -42,6 +45,7 @@ target-version = "py311"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q --ignore=tests/fixtures"
+markers = ["integration: end-to-end test that requires a Docker daemon"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

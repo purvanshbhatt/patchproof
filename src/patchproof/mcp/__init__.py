@@ -1,0 +1,1 @@
+"""PatchProof MCP server package."""
